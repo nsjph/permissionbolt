@@ -293,8 +293,23 @@ func (state *UserState) addUserUnchecked(username, passwordHash, email string) {
 // AddUser creates a user and hashes the password, does not check for rights.
 // The given data must be valid.
 func (state *UserState) AddUser(username, password, email string) {
-	passwordHash := state.HashPassword(username, password)
+	var salt string
+	var passwordHash string
+	var err error
+	switch state.PasswordAlgo() {
+	case "pbkdf2":
+		salt, err = GenerateSalt(4)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "AddUser failure generating salt: %v\n", err)
+		}
+		passwordHash = state.HashPasswordWithSalt(username, password, salt)
+	default:
+		passwordHash = state.HashPassword(username, password)
+	}
 	state.addUserUnchecked(username, passwordHash, email)
+	if salt != "" {
+		state.users.Set(username, "salt", salt)
+	}
 }
 
 // SetLoggedIn marks a user as logged in.
@@ -402,25 +417,50 @@ func (state *UserState) HashPassword(username, password string) string {
 	return ""
 }
 
+// HashPasswordWithSalt takes a password and creates a password hash.
+// It also takes a username, since some algorithms may use it for salt.
+// FIXME: Integrate pbkdf2 hashing here. Haven't done so immediately, to avoid
+// changing the function signature, breaking existing user code
+func (state *UserState) HashPasswordWithSalt(username, password, salt string) string {
+	switch state.passwordAlgorithm {
+	case "pbkdf2":
+		return string(hashPbkdf2(salt, username, password))
+	default:
+		return ""
+	}
+}
+
+// GenerateSalt creates a random salt of size bytes. Returns a hex-encoded string.
+// Size must be minimum of 4 (32 bits) to meet NIST recommendations https://github.com/usnistgov/800-63-3
+func GenerateSalt(size int) (string, error) {
+
+	if size < 4 {
+		return "", errors.New("Size should be 4 bytes (32bits) or longer")
+	}
+
+	saltBytes := make([]byte, size)
+	_, err := rand.Read(saltBytes)
+	if err != nil {
+		// FIXME: Need a better way to report back failure
+		return "", errors.New("Failed to read random bytes for salt")
+	}
+
+	return hex.EncodeToString(saltBytes), nil
+}
+
 // SetPassword sets/changes the password for a user.
 // Does not take a password hash, will hash the password string.
 // FIXME: Needs error checking
 func (state *UserState) SetPassword(username, password string) {
 	switch state.passwordAlgorithm {
 	case "pbkdf2":
-
-		saltBytes := make([]byte, 4)
-		_, err := rand.Read(saltBytes)
+		salt, err := GenerateSalt(4)
 		if err != nil {
-			// FIXME: Need a better way to report back failure
-			fmt.Fprintf(os.Stderr, "Unable to generate random bytes for salt. SetPassword for user: %s failed.\n", username)
-			return
+			fmt.Fprintf(os.Stderr, "GenerateSalt failure: %v\n", err)
 		}
 
-		salt := hex.EncodeToString(saltBytes)
-
 		state.users.Set(username, "salt", salt)
-		state.users.Set(username, "password", string(hashPbkdf2(salt, username, password)))
+		state.users.Set(username, "password", state.HashPasswordWithSalt(username, password, salt))
 
 	default:
 		state.users.Set(username, "password", state.HashPassword(username, password))
@@ -441,12 +481,14 @@ func (state *UserState) storedHash(username string) []byte {
 func (state *UserState) CorrectPassword(username, password string) bool {
 
 	if !state.HasUser(username) {
+		fmt.Fprintf(os.Stderr, "CorrectPassword error - username %s does not exist\n", username)
 		return false
 	}
 
 	// Retrieve the stored password hash
 	hash := state.storedHash(username)
 	if len(hash) == 0 {
+		fmt.Fprintf(os.Stderr, "CorrectPassword error - hash length zero\n")
 		return false
 	}
 
@@ -464,6 +506,7 @@ func (state *UserState) CorrectPassword(username, password string) bool {
 	case "pbkdf2":
 		salt, err := state.Salt(username)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting salt for username %s: %v\n", username, err)
 			return false
 		}
 		return correctPbkdf2(hash, salt, password)
