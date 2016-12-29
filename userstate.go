@@ -1,10 +1,14 @@
 package permissionbolt
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
-	"math/rand"
+	"fmt"
+	"os"
+	//"math/rand"
+
 	"net/http"
-	"time"
 
 	"github.com/xyproto/cookie"     // Functions related to cookies
 	"github.com/xyproto/pinterface" // Database interfaces
@@ -26,6 +30,7 @@ type UserState struct {
 	unconfirmed       *simplebolt.Set      // A list of unconfirmed usernames, for easy enumeration
 	db                *simplebolt.Database // A Bolt database
 	cookieSecret      string               // Secret for storing secure cookies
+	salt              string               // Hex Encoded salt
 	cookieTime        int64                // How long a cookie should last, in seconds
 	passwordAlgorithm string               // The hashing algorithm to utilize default: "bcrypt+" allowed: ("sha256", "bcrypt", "bcrypt+")
 }
@@ -72,16 +77,17 @@ func NewUserState(filename string, randomseed bool) (*UserState, error) {
 	state.cookieSecret = cookie.RandomCookieFriendlyString(30)
 
 	// Seed the random number generator
-	if randomseed {
-		rand.Seed(time.Now().UnixNano())
-	}
+	// if randomseed {
+	// 	rand.Seed(time.Now().UnixNano())
+	// }
 
 	// Cookies lasts for 24 hours by default. Specified in seconds.
 	state.cookieTime = 3600 * 24
 
 	// Default password hashing algorithm is "bcrypt+", which is the same as
 	// "bcrypt", but with backwards compatibility for checking sha256 hashes.
-	state.passwordAlgorithm = "bcrypt+" // "bcrypt+", "bcrypt" or "sha256"
+	//state.passwordAlgorithm = "bcrypt+" // "bcrypt+", "bcrypt" or "sha256"
+	state.passwordAlgorithm = "pbkdf2"
 
 	return state, nil
 }
@@ -350,6 +356,11 @@ func (state *UserState) SetCookieSecret(cookieSecret string) {
 	state.cookieSecret = cookieSecret
 }
 
+// Salt returns the salt for the given username.
+func (state *UserState) Salt(username string) (string, error) {
+	return state.users.Get(username, "salt")
+}
+
 // PasswordAlgo returns the current password hashing algorithm.
 func (state *UserState) PasswordAlgo() string {
 	return state.passwordAlgorithm
@@ -368,7 +379,7 @@ func (state *UserState) PasswordAlgo() string {
  */
 func (state *UserState) SetPasswordAlgo(algorithm string) error {
 	switch algorithm {
-	case "sha256", "bcrypt", "bcrypt+":
+	case "sha256", "bcrypt", "bcrypt+", "pbkdf2":
 		state.passwordAlgorithm = algorithm
 	default:
 		return errors.New("Permissions: " + algorithm + " is an unsupported encryption algorithm")
@@ -378,6 +389,8 @@ func (state *UserState) SetPasswordAlgo(algorithm string) error {
 
 // HashPassword takes a password and creates a password hash.
 // It also takes a username, since some algorithms may use it for salt.
+// FIXME: Integrate pbkdf2 hashing here. Haven't done so immediately, to avoid
+// changing the function signature, breaking existing user code
 func (state *UserState) HashPassword(username, password string) string {
 	switch state.passwordAlgorithm {
 	case "sha256":
@@ -391,8 +404,27 @@ func (state *UserState) HashPassword(username, password string) string {
 
 // SetPassword sets/changes the password for a user.
 // Does not take a password hash, will hash the password string.
+// FIXME: Needs error checking
 func (state *UserState) SetPassword(username, password string) {
-	state.users.Set(username, "password", state.HashPassword(username, password))
+	switch state.passwordAlgorithm {
+	case "pbkdf2":
+
+		saltBytes := make([]byte, 4)
+		_, err := rand.Read(saltBytes)
+		if err != nil {
+			// FIXME: Need a better way to report back failure
+			fmt.Fprintf(os.Stderr, "Unable to generate random bytes for salt. SetPassword for user: %s failed.\n", username)
+			return
+		}
+
+		salt := hex.EncodeToString(saltBytes)
+
+		state.users.Set(username, "salt", salt)
+		state.users.Set(username, "password", string(hashPbkdf2(salt, username, password)))
+
+	default:
+		state.users.Set(username, "password", state.HashPassword(username, password))
+	}
 }
 
 // Return the stored hash, or an empty byte slice.
@@ -429,6 +461,12 @@ func (state *UserState) CorrectPassword(username, password string) bool {
 			return true
 		}
 		return correctBcrypt(hash, password)
+	case "pbkdf2":
+		salt, err := state.Salt(username)
+		if err != nil {
+			return false
+		}
+		return correctPbkdf2(hash, salt, password)
 	}
 	return false
 }
